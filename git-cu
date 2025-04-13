@@ -82,10 +82,6 @@ cu_patchwork_url() {
 	git config --default "https://patchwork.ozlabs.org" "git-pad.patchwork-url"
 }
 
-cu_send_to() {
-	git config --default "$(git config user.email)" "git-pad.send-to"
-}
-
 cu_dir() {
 	local git_dir=$(git rev-parse --absolute-git-dir)
 	echo -n "$git_dir/$MAIN_FOLDER"
@@ -247,7 +243,6 @@ opt_send() {
 		--cover-letter \
 		--cover-from-description=subject \
 		--signoff \
-		--to "$(cu_send_to)" \
 		-o $(cu_patches_dir) \
 		-v$revision \
 		$base_commit)
@@ -263,7 +258,10 @@ opt_send() {
 		exit 1
 	fi
 
-	git send-email $(echo "$ret" | tr '\n' ' ')
+	git send-email \
+		--to-cover \
+		--cc-cover \
+		$(echo "$ret" | tr '\n' ' ')
 
 	echo "Current revision is $revision"
 	read -p "Do you want to increment it? (y/n): " response
