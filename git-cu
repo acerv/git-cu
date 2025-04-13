@@ -258,6 +258,8 @@ opt_send() {
 		exit 1
 	fi
 
+	$(git config --get core.editor) $(echo "$ret" | grep '0000-cover-letter\.patch')
+
 	git send-email \
 		--to-cover \
 		--cc-cover \
