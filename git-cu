@@ -1,0 +1,306 @@
+#!/bin/sh -e
+#
+# This Git command is meant to simplify the workflows for projects which are
+# based on Mailing List, using patchwork as the main interface.
+#
+# It is inspired by the `b4` project that it's implementing only a few of
+# its features.
+#
+# Author: Andrea Cervesato <andrea.cervesato@suse.com>
+
+# TODO: implement the following commands
+# --trailers: fetch all trailers
+
+print_help() {
+	cat <<EOF
+Configuration options:
+
+    -n, --new         create a new branch and save the base commit as reference
+    -a, --archive     archive and delete a branch created by "cu" command
+    -e, --edit-cover  edit the cover letter used by the current branch
+    -v, --revision    force the current revision
+
+Patchwork options:
+
+    -p, --apply-patch   apply a patch ID via patchwork
+    -s, --apply-series  apply a patch-series ID via patchwork
+
+Sending options:
+    -x, --send  prepare patch-series and send them via send-email
+
+EOF
+}
+
+if [ -z "$1" ]; then
+	print_help
+	exit 1
+fi
+
+#####################
+# Helpers functions
+#####################
+command_exists() {
+	command -v $1 >/dev/null 2>&1
+
+	if [ $? -ne 0 ]; then
+		echo "'$1' must be present in the system"
+		exit 1
+	fi
+}
+
+curl_get() {
+	curl -G $@
+
+	if [ $? -ne 0 ]; then
+		exit 1
+	fi
+}
+
+git_repo_exists() {
+	if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		return
+	fi
+
+	echo "Not a git repository"
+	exit 1
+}
+
+git_current_branch() {
+	git rev-parse --abbrev-ref HEAD
+}
+
+########################
+# Script configuration
+########################
+command_exists "curl"
+command_exists "jq"
+
+readonly BRANCH_SUFFIX="cu-"
+readonly MAIN_FOLDER="x-cu"
+
+cu_patchwork_url() {
+	git config --default "https://patchwork.ozlabs.org" "git-pad.patchwork-url"
+}
+
+cu_send_to() {
+	git config --default "$(git config user.email)" "git-pad.send-to"
+}
+
+cu_dir() {
+	local git_dir=$(git rev-parse --absolute-git-dir)
+	echo -n "$git_dir/$MAIN_FOLDER"
+}
+
+cu_archived_dir() {
+	echo -n "$(cu_dir)/archived"
+}
+
+cu_branch_dir() {
+	echo -n "$(cu_dir)/$(git_current_branch)"
+}
+
+cu_revision_file() {
+	echo -n "$(cu_branch_dir)/revision"
+}
+
+cu_patches_dir() {
+	echo -n "$(cu_branch_dir)/patches"
+}
+
+cu_base_commit_file() {
+	echo -n "$(cu_branch_dir)/base-commit"
+}
+
+cu_prepare_repo() {
+	git_repo_exists
+
+	mkdir -p "$(cu_dir)"
+	mkdir -p "$(cu_archived_dir)"
+}
+
+###################################
+# Patchwork communication options
+###################################
+opt_apply() {
+	local opttype="$1"
+	local optid="$2"
+
+	if [ -z "$optid" ]; then
+		echo "Please provide an ID"
+		exit 1
+	fi
+
+	local ret=$(curl_get "$(cu_patchwork_url)/api/$opttype/$optid/")
+	local err=$(echo "$ret" | jq -r '.detail')
+
+	if [ "$err" != "null" ]; then
+		echo "$err"
+		exit 1
+	fi
+
+	curl_get $(echo "$ret" | jq -r '.mbox') | git am
+}
+
+#########################
+# Configuration options
+#########################
+opt_new() {
+	git checkout -b "$BRANCH_SUFFIX$1"
+	mkdir -p "$(cu_branch_dir)"
+
+	local revision_file="$(cu_revision_file)"
+	if [ ! -e "$revision_file" ]; then
+		echo -n "1" >"$revision_file"
+	fi
+
+	local patches_dir="$(cu_patches_dir)"
+	mkdir -p "$patches_dir"
+
+	local base_commit="$(git rev-parse HEAD)"
+	echo -n "$base_commit" >$(cu_base_commit_file)
+
+	echo -e "Patches folder:\t$patches_dir"
+	echo -e "Base commit:\t$base_commit"
+	echo -e "Revision:\tv1"
+}
+
+opt_archive() {
+	local branch="$1"
+
+	if [ "$(git_current_branch)" = "$branch" ]; then
+		echo "Can't cleanup '$branch' branch in within the branch"
+		exit 1
+	fi
+
+	if [ -z $(git branch --list "$branch") ]; then
+		echo "Branch doesn't exist"
+		exit 1
+	fi
+
+	local folder="$(cu_dir)/$branch"
+
+	if [ ! -e "$folder" ]; then
+		echo "Branch '$branch' folder doesn't exist"
+		exit 1
+	fi
+
+	tar -czf "$(cu_archived_dir)/$(date +%Y-%m-%d-%H_%M_%S)-$branch.tar.gz" -C "$folder" .
+	rm -rf "$folder"
+
+	git branch -D "$branch"
+
+	echo "Branch has been archived"
+}
+
+opt_edit_cover() {
+	if [ "$(git_current_branch)" = "master" ]; then
+		echo "No covers for 'master' branch"
+		exit 1
+	fi
+
+	git branch --edit-description
+}
+
+opt_revision() {
+	local revision=""
+
+	if echo "$1" | grep -qE '^[0-9]+$'; then
+		echo "Forcing revision $1"
+		revision="$1"
+	else
+		echo "Revision must be an integer number"
+		exit 1
+	fi
+
+	echo -n "$revision" >"$(cu_revision_file)"
+
+}
+
+####################
+# Sending options
+####################
+revision_current() {
+	cat $(cu_revision_file)
+}
+
+revision_increment() {
+	echo -n "$(($(revision_current) + 1))" >"$(cu_revision_file)"
+}
+
+opt_send() {
+	if [ ! -e $(cu_branch_dir) ]; then
+		echo "Can't send patches from a normal branch. "
+		echo "Please create a branch using --new, since it's"
+		echo "required due to base commit tracking."
+		exit 1
+	fi
+
+	if ! git config branch.$(git_current_branch).description >/dev/null; then
+		echo "Please use --edit-cover before sending patches"
+		exit 1
+	fi
+
+	local revision=$(revision_current)
+	local base_commit=$(cat $(cu_base_commit_file))
+
+	ret=$(git format-patch \
+		--cover-letter \
+		--cover-from-description=subject \
+		--signoff \
+		--to "$(cu_send_to)" \
+		-o $(cu_patches_dir) \
+		-v$revision \
+		$base_commit)
+
+	if [ $? -ne 0 ]; then
+		echo "git-format-patch command failed:"
+		echo "$ret"
+		exit 1
+	fi
+
+	if [ -z "$ret" ]; then
+		echo "No patches to send"
+		exit 1
+	fi
+
+	git send-email $(echo "$ret" | tr '\n' ' ')
+
+	echo "Current revision is $revision"
+	read -p "Do you want to increment it? (y/n): " response
+
+	if [ "$response" = "y" ]; then
+		revision_increment
+	fi
+}
+
+##################
+# Initialization
+##################
+cu_prepare_repo
+
+case "$1" in
+-n | --new)
+	opt_new "$2"
+	;;
+-a | --archive)
+	opt_archive "$2"
+	;;
+-p | --apply-patch)
+	opt_apply "patches" "$2"
+	;;
+-s | --apply-series)
+	opt_apply "series" "$2"
+	;;
+-e | --edit-cover)
+	opt_edit_cover "$2"
+	;;
+-v | --revision)
+	opt_revision "$2"
+	;;
+-x | --send)
+	opt_send
+	;;
+*)
+	print_help
+	;;
+esac
